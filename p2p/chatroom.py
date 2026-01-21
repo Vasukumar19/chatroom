@@ -1,20 +1,24 @@
-"""Chat room with message history and real-time sync"""
+"""Chat room with message history and real-time sync - CORRECTED VERSION"""
 
 import threading
+import uuid
 from dataclasses import dataclass, asdict
-from typing import List
+from typing import List, Set
 from datetime import datetime
 
 
 @dataclass
 class ChatMessage:
-    """Chat message with metadata"""
+    """Chat message with metadata and unique ID"""
     Message: str
     SenderID: str
     SenderNick: str
+    MessageID: str = None  # FIX: Add unique message ID
     Timestamp: str = None
     
     def __post_init__(self):
+        if self.MessageID is None:
+            self.MessageID = str(uuid.uuid4())[:12]
         if self.Timestamp is None:
             self.Timestamp = datetime.now().isoformat()
 
@@ -32,6 +36,7 @@ class ChatRoom:
         self.p2p_host = p2p_host
         self.messages: List[ChatMessage] = []
         self.message_lock = threading.Lock()
+        self.seen_message_ids: Set[str] = set()  # FIX: Track by message ID
         
         # Register to receive messages
         self.p2p_host.add_message_handler(self._handle_incoming_message)
@@ -44,10 +49,10 @@ class ChatRoom:
             message: Text message to send
             
         Returns:
-            True if sent successfully
+            True if sent successfully to at least one peer
         """
         try:
-            # Create message object
+            # Create message object with unique ID
             chat_msg = ChatMessage(
                 Message=message,
                 SenderID=self.peer_id,
@@ -57,6 +62,7 @@ class ChatRoom:
             # Save to local history
             with self.message_lock:
                 self.messages.append(chat_msg)
+                self.seen_message_ids.add(chat_msg.MessageID)
             
             # Broadcast to peers
             broadcast_data = {
@@ -98,28 +104,35 @@ class ChatRoom:
             
             # Parse message
             data = message_data.get('data', {})
+            
+            # Validate required fields
+            if not all(key in data for key in ['Message', 'SenderID', 'SenderNick']):
+                print("⚠️  Received invalid message format")
+                return
+            
             chat_msg = ChatMessage(**data)
             
             # Don't show our own messages again
             if chat_msg.SenderID == self.peer_id:
                 return
             
-            # Add to history (with duplicate check)
+            # FIX: Improved duplicate detection using message ID
             with self.message_lock:
-                is_duplicate = any(
-                    m.SenderID == chat_msg.SenderID and 
-                    m.Message == chat_msg.Message and 
-                    m.Timestamp == chat_msg.Timestamp 
-                    for m in self.messages
-                )
+                if chat_msg.MessageID in self.seen_message_ids:
+                    return  # Already seen this message
                 
-                if not is_duplicate:
-                    self.messages.append(chat_msg)
-                    print(f"\n📥 {chat_msg.SenderNick}: {chat_msg.Message}")
-                    print(f"[{self.nickname}] ", end='', flush=True)
-                    
-        except Exception:
-            pass
+                # Add to history
+                self.messages.append(chat_msg)
+                self.seen_message_ids.add(chat_msg.MessageID)
+                
+                # Display message
+                print(f"\n📥 {chat_msg.SenderNick}: {chat_msg.Message}")
+                print(f"[{self.nickname}] ", end='', flush=True)
+                
+        except TypeError as e:
+            print(f"⚠️  Message parsing error: {e}")
+        except Exception as e:
+            print(f"⚠️  Error handling message: {e}")
     
     def get_messages(self) -> List[str]:
         """
@@ -133,6 +146,16 @@ class ChatRoom:
                 f"[{msg.Timestamp}] {msg.SenderNick}: {msg.Message}"
                 for msg in self.messages
             ]
+    
+    def get_raw_messages(self) -> List[dict]:
+        """
+        Get all messages as dictionaries for API
+        
+        Returns:
+            List of message dictionaries
+        """
+        with self.message_lock:
+            return [asdict(msg) for msg in self.messages]
     
     def get_message_count(self) -> int:
         """Get total message count"""
