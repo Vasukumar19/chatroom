@@ -1,6 +1,6 @@
 """
 DisasterConnect - Best P2P Local Chat Application
-Production-ready with automatic configuration
+Production-ready with automatic configuration - CORRECTED VERSION
 """
 import sys
 import socket
@@ -76,28 +76,65 @@ def get_messages():
     return jsonify([])
 
 
+@app.route('/messages/raw', methods=['GET'])
+def get_raw_messages():
+    """Get all messages in raw format (with metadata)"""
+    if chat_room:
+        return jsonify(chat_room.get_raw_messages())
+    return jsonify([])
+
+
 @app.route('/send', methods=['POST'])
 def send_message():
     """Send a chat message"""
     try:
+        # FIX: Improved input validation
         data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                "status": "error", 
+                "message": "No data provided"
+            }), 400
+        
+        if not isinstance(data, dict):
+            return jsonify({
+                "status": "error", 
+                "message": "Invalid data format"
+            }), 400
+        
         message = data.get('message', '').strip()
         
         if not message:
-            return jsonify({"status": "error", "message": "Empty message"}), 400
+            return jsonify({
+                "status": "error", 
+                "message": "Empty message"
+            }), 400
+        
+        if len(message) > 1000:
+            return jsonify({
+                "status": "error", 
+                "message": "Message too long (max 1000 characters)"
+            }), 400
         
         if not chat_room:
-            return jsonify({"status": "error", "message": "Chat not ready"}), 503
+            return jsonify({
+                "status": "error", 
+                "message": "Chat not ready"
+            }), 503
         
         success = chat_room.publish(message)
         
-        if success:
-            return jsonify({"status": "success"}), 200
-        else:
-            return jsonify({"status": "error", "message": "Send failed"}), 500
+        return jsonify({
+            "status": "success",
+            "message": "Message sent" if success else "Message saved (no peers connected)"
+        }), 200
             
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
+        return jsonify({
+            "status": "error", 
+            "message": f"Internal error: {str(e)}"
+        }), 500
 
 
 @app.route('/peers', methods=['GET'])
@@ -151,6 +188,17 @@ def get_status():
     })
 
 
+# Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
+
+
 # ==================== P2P INITIALIZATION ====================
 
 def on_peer_discovered(peer_id: str, peer_ip: str, peer_port: int):
@@ -187,9 +235,6 @@ def initialize_p2p(p2p_port: int, room_name: str, nickname: str):
     chat_room = join_chat_room(room_name, nickname, p2p_host.peer_id, p2p_host)
     time.sleep(0.5)
     
-    # Send join notification
-    chat_room.publish(f"👋 {nickname} joined the chat!")
-    
     # Step 4: Start Terminal Interface
     print("[4/4] ⌨️  Starting terminal interface...")
     terminal_interface = start_terminal_interface(chat_room, nickname)
@@ -214,13 +259,16 @@ def run_flask(http_port: int):
     print(f"\n💡 Tip: Other devices can join by running this app with the same room name")
     print(f"⚠️  Press Ctrl+C to stop\n")
     
-    app.run(
-        host='0.0.0.0',
-        port=http_port,
-        debug=False,
-        use_reloader=False,
-        threaded=True
-    )
+    try:
+        app.run(
+            host='0.0.0.0',
+            port=http_port,
+            debug=False,
+            use_reloader=False,
+            threaded=True
+        )
+    except Exception as e:
+        print(f"\n❌ Flask server error: {e}")
 
 
 # ==================== MAIN ENTRY POINT ====================
@@ -266,5 +314,7 @@ if __name__ == '__main__':
         
     except Exception as e:
         print(f"\n❌ Fatal Error: {e}")
-        print("Please try restarting the application.\n")
+        import traceback
+        traceback.print_exc()
+        print("\nPlease try restarting the application.\n")
         sys.exit(1)
