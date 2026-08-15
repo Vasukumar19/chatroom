@@ -57,24 +57,47 @@ class MockTransport(Transport):
 
 
 class UDPTransport(Transport):
-    """A minimal UDP transport wrapper (basic, not yet used by app).
+    """A hardened UDP transport wrapper.
 
-    This class provides send/receive over UDP for future integration. It keeps
-    receive loop in a background thread and calls registered handlers.
+    Features:
+    - Optional broadcast support (`broadcast=True` sets `SO_BROADCAST`).
+    - Configurable recv timeout.
+    - Clean start/stop with thread join.
+    - Explicit bind address/port.
+    - JSON framing and robust error handling.
     """
-    def __init__(self, bind_addr: str = '0.0.0.0', bind_port: int = 0):
+    def __init__(self, bind_addr: str = '0.0.0.0', bind_port: int = 0, *, broadcast: bool = False, timeout: float = 1.0):
         self.bind_addr = bind_addr
         self.bind_port = bind_port
+        self.broadcast = broadcast
+        self.timeout = float(timeout)
         self.sock: Optional[socket.socket] = None
         self.recv_thread: Optional[threading.Thread] = None
         self.running = False
         self.handlers = []
 
     def start(self) -> None:
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((self.bind_addr, self.bind_port))
-        self.sock.settimeout(1.0)
+        if self.running:
+            return
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if self.broadcast:
+                try:
+                    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                except Exception:
+                    pass
+            self.sock.bind((self.bind_addr, self.bind_port))
+            self.sock.settimeout(self.timeout)
+        except Exception:
+            if self.sock:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+            self.sock = None
+            raise
+
         self.running = True
 
         def _loop():
@@ -84,6 +107,7 @@ class UDPTransport(Transport):
                     try:
                         msg = json.loads(data.decode('utf-8'))
                     except Exception:
+                        # malformed JSON — ignore
                         continue
                     for h in list(self.handlers):
                         try:
@@ -94,24 +118,36 @@ class UDPTransport(Transport):
                     continue
                 except Exception:
                     if self.running:
-                        pass
+                        # swallow and continue; handlers should be resilient
+                        continue
 
         self.recv_thread = threading.Thread(target=_loop, daemon=True)
         self.recv_thread.start()
 
     def stop(self) -> None:
         self.running = False
+        # close socket first to unblock recv
         try:
             if self.sock:
                 self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+        # join thread if running
+        try:
+            if self.recv_thread and self.recv_thread.is_alive():
+                self.recv_thread.join(timeout=1.0)
         except Exception:
             pass
 
     def send(self, address: Tuple[str, int], message: Dict[str, Any]) -> None:
         if not self.sock:
             raise RuntimeError('Transport not started')
-        data = json.dumps(message).encode('utf-8')
-        self.sock.sendto(data, address)
+        try:
+            data = json.dumps(message).encode('utf-8')
+            self.sock.sendto(data, address)
+        except Exception:
+            raise
 
     def register_handler(self, handler: Callable[[Dict[str, Any], Tuple[str, int]], None]) -> None:
         self.handlers.append(handler)
