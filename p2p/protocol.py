@@ -16,6 +16,9 @@ SUPPORTED_TYPES = {
     'sync_response'
 }
 
+# Heartbeat types used by Phase 4
+SUPPORTED_TYPES.update({'heartbeat', 'heartbeat_ack'})
+
 
 @dataclass
 class Envelope:
