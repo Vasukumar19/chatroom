@@ -18,6 +18,8 @@ SUPPORTED_TYPES = {
 
 # Heartbeat types used by Phase 4
 SUPPORTED_TYPES.update({'heartbeat', 'heartbeat_ack'})
+# Route advertisement for Phase 5.5
+SUPPORTED_TYPES.update({'route_advertisement'})
 
 
 @dataclass

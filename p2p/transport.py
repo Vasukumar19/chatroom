@@ -37,6 +37,8 @@ class MockTransport(Transport):
     def __init__(self):
         self.handlers = []
         self.started = False
+        self.last_sent = None
+        self.last_sent_addr = None
 
     def start(self) -> None:
         self.started = True
@@ -45,7 +47,17 @@ class MockTransport(Transport):
         self.started = False
 
     def send(self, address: Tuple[str, int], message: Dict[str, Any]) -> None:
-        # Simulate delivery by invoking handlers with the provided 'address'
+        # record last sent for tests and simulate delivery by invoking handlers
+        self.last_sent = message
+        self.last_sent_addr = address
+        for h in list(self.handlers):
+            try:
+                h(message, address)
+            except Exception:
+                pass
+
+    def simulate_incoming(self, message: Dict[str, Any], address: Tuple[str, int]) -> None:
+        # Directly invoke handlers as if a message arrived from `address`
         for h in list(self.handlers):
             try:
                 h(message, address)
