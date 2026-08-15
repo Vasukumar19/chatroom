@@ -39,6 +39,7 @@ class MockTransport(Transport):
         self.started = False
         self.last_sent = None
         self.last_sent_addr = None
+        self.sent_history = []
 
     def start(self) -> None:
         self.started = True
@@ -50,6 +51,7 @@ class MockTransport(Transport):
         # record last sent for tests and simulate delivery by invoking handlers
         self.last_sent = message
         self.last_sent_addr = address
+        self.sent_history.append((address, message))
         for h in list(self.handlers):
             try:
                 h(message, address)

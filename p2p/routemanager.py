@@ -1,5 +1,7 @@
 """RouteLearner/RouteManager: learns routes from peer announcements and peer events."""
 from typing import Callable
+import threading
+import time
 
 from p2p.protocol import create_envelope, validate_envelope
 from p2p.routing import RoutingTable
@@ -7,11 +9,18 @@ from p2p.peermanager import PeerManager
 
 
 class RouteLearner:
-    def __init__(self, node_id: str, peer_manager: PeerManager, routing_table: RoutingTable, transport):
+    def __init__(self, node_id: str, peer_manager: PeerManager, routing_table: RoutingTable, transport, *, min_advert_interval: float = 1.0):
         self.node_id = node_id
         self.peer_manager = peer_manager
         self.routing_table = routing_table
         self.transport = transport
+        self.min_advert_interval = float(min_advert_interval)
+
+        # advertisement rate-limiting/coalescing
+        self._advert_lock = threading.Lock()
+        self._last_advert_time = 0.0
+        self._last_advert_hash = None
+        self._scheduled_timer = None
 
         # register callbacks
         self.peer_manager.on_peer_discovered = self._on_peer_discovered
@@ -50,10 +59,93 @@ class RouteLearner:
         env = create_envelope('route_advertisement', source=self.node_id, payload={'routes': routes})
         self.transport.send(address, env)
 
+    def _compute_routes_snapshot(self):
+        routes = {}
+        for dest, mapping in self.routing_table._routes.items():
+            best = min((e.metric for e in mapping.values()), default=None)
+            if best is not None:
+                routes[dest] = best
+        return routes
+
+    def _ad_payload_hash(self, routes: dict):
+        # deterministic hash for route payloads
+        items = tuple(sorted(routes.items()))
+        return hash(items)
+
+    def request_advertisement(self):
+        """Request that a route advertisement be sent to peers.
+        This method coalesces requests and rate-limits actual sends.
+        """
+        with self._advert_lock:
+            routes = self._compute_routes_snapshot()
+            cur_hash = self._ad_payload_hash(routes)
+            now = time.time()
+            # suppress identical advertisement
+            if self._last_advert_hash == cur_hash and now - self._last_advert_time < (self.min_advert_interval * 10):
+                return
+
+            # if last advert was recent, schedule for later
+            delta = now - self._last_advert_time
+            if delta < self.min_advert_interval:
+                # schedule the send at last_advert_time + min_advert_interval
+                when = self.min_advert_interval - delta
+                if self._scheduled_timer is None:
+                    self._scheduled_timer = threading.Timer(when, self._flush_scheduled_advertisement)
+                    self._scheduled_timer.daemon = True
+                    self._scheduled_timer.start()
+                return
+
+            # otherwise send immediately without re-entering the lock
+            self._send_advertisement_locked()
+
+    def _flush_scheduled_advertisement(self):
+        with self._advert_lock:
+            self._scheduled_timer = None
+            self._send_advertisement_locked()
+
+    def _send_advertisement_locked(self):
+        # clear scheduled timer
+        if self._scheduled_timer:
+            try:
+                self._scheduled_timer.cancel()
+            except Exception:
+                pass
+            self._scheduled_timer = None
+
+        routes = self._compute_routes_snapshot()
+        cur_hash = self._ad_payload_hash(routes)
+        now = time.time()
+        # if identical to last and within interval suppress
+        if self._last_advert_hash == cur_hash and now - self._last_advert_time < self.min_advert_interval:
+            return
+
+        # send to all known peers
+        env = create_envelope('route_advertisement', source=self.node_id, payload={'routes': routes})
+        peers = self.peer_manager.get_peers()
+        for pid, (ip, port) in peers.items():
+            try:
+                self.transport.send((ip, port), env)
+            except Exception:
+                pass
+
+        self._last_advert_time = time.time()
+        self._last_advert_hash = cur_hash
+
+    def _send_advertisement(self):
+        # Backward compatibility shim: callers may still invoke this directly.
+        # It deliberately avoids re-entering the same lock.
+        with self._advert_lock:
+            self._send_advertisement_locked()
+
     def _on_peer_discovered(self, peer_id: str, ip: str, port: int):
         # when a new peer is discovered, announce our known peers to it
         try:
             self.send_announcement((ip, port))
+        except Exception:
+            pass
+        # schedule advertisement of our routes to propagate knowledge
+        try:
+            self.request_advertisement()
         except Exception:
             pass
 
@@ -63,6 +155,10 @@ class RouteLearner:
         for dest, mapping in list(self.routing_table._routes.items()):
             if peer_id in mapping:
                 self.routing_table.remove_route(dest, peer_id)
+        try:
+            self.request_advertisement()
+        except Exception:
+            pass
 
     def _on_transport_message(self, msg, addr):
         try:
@@ -92,6 +188,11 @@ class RouteLearner:
                         self.routing_table.add_route(pid, src, ip, port, metric=1, hops=1)
                     except Exception:
                         pass
+                    else:
+                        try:
+                            self.request_advertisement()
+                        except Exception:
+                            pass
         elif mtype == 'route_advertisement':
             routes = payload.get('routes', {})
             for dest, advertised_metric in routes.items():
@@ -114,3 +215,8 @@ class RouteLearner:
                     self.routing_table.add_route(dest, src, addr[0], addr[1], metric=new_metric, hops=new_metric)
                 except Exception:
                     pass
+                else:
+                    try:
+                        self.request_advertisement()
+                    except Exception:
+                        pass

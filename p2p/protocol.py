@@ -1,6 +1,6 @@
 """Message protocol: envelope model, serialization, validation."""
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import uuid
 from typing import Any, Dict, Optional
@@ -37,7 +37,8 @@ class Envelope:
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat() + 'Z'
+    # Use timezone-aware UTC timestamps and keep 'Z' suffix for compatibility
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
 def create_envelope(
