@@ -50,6 +50,7 @@ def create_envelope(
     ttl: int = 8,
     priority: int = 0,
     protocol_version: str = "1",
+    message_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     if msg_type not in SUPPORTED_TYPES:
         raise ValueError(f"Unsupported message type: {msg_type}")
@@ -59,7 +60,7 @@ def create_envelope(
         raise ValueError("Priority must be non-negative integer")
 
     env = Envelope(
-        message_id=str(uuid.uuid4()),
+        message_id=str(message_id) if message_id is not None else str(uuid.uuid4()),
         type=msg_type,
         source=source,
         destination=destination,

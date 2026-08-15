@@ -50,6 +50,8 @@ class Router:
         if not mid:
             return
 
+        seen_key = (msg.get('type'), mid, msg.get('delivery_attempt', 0))
+
         now = time.time()
         with self._lock:
             # periodic cleanup
@@ -58,9 +60,9 @@ class Router:
                 self._cleanup_seen(now)
                 self._seen_checks = 0
 
-            if mid in self.seen:
+            if seen_key in self.seen:
                 return
-            self.seen[mid] = now
+            self.seen[seen_key] = now
 
         # ttl/hop_count handling
         ttl = msg.get('ttl', 0)
