@@ -21,3 +21,10 @@ class RouteManager:
             mapped = 'INVALID'
 
         self.routing_table.set_next_hop_status(peer_id, mapped)
+
+    def attach_to_heartbeat(self, heartbeat_manager):
+        # Wire heartbeat events to route manager without heartbeat importing routing
+        try:
+            heartbeat_manager.on_status_change = self.on_peer_status_change
+        except Exception:
+            pass
