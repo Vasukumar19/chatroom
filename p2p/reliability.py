@@ -41,8 +41,8 @@ class ReliableSender:
         except Exception:
             pass
 
-    def send(self, destination: str, payload: Dict[str, object]) -> bool:
-        message_id = f"{self.node_id}:{int(time.time() * 1000000)}:{len(self._pending)}"
+    def send(self, destination: str, payload: Dict[str, object], message_id: Optional[str] = None) -> bool:
+        message_id = message_id or f"{self.node_id}:{int(time.time() * 1000000)}:{len(self._pending)}"
         self.last_message_id = message_id
         self.last_status = 'SENT'
         self.retry_count = 0
