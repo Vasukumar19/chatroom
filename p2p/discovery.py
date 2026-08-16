@@ -170,10 +170,11 @@ class PeerDiscovery:
                     debug("Missing peer_id or peer_port")
                     continue
                 
-                # Only trigger callback for new peers
-                if peer_id and peer_id not in self.discovered_peers:
-                    self.discovered_peers.add(peer_id)
-                    print(f"✓ Discovered peer: {peer_id}")
+                if peer_id:
+                    is_new = peer_id not in self.discovered_peers
+                    if is_new:
+                        self.discovered_peers.add(peer_id)
+                        print(f"✓ Discovered peer: {peer_id}")
                     debug(f"Peer details - IP: {peer_ip}, Port: {peer_port}")
                     
                     if self.on_peer_found:
@@ -185,8 +186,6 @@ class PeerDiscovery:
                             print(f"⚠️  Error in peer discovery callback: {e}")
                             import traceback
                             traceback.print_exc()
-                else:
-                    debug(f"Already discovered peer {peer_id}")
                             
             except socket.timeout:
                 continue
@@ -233,9 +232,11 @@ class PeerDiscovery:
             peer_id = msg.get('peer_id')
             peer_port = msg.get('p2p_port')
             peer_ip = addr[0]
-            if peer_id and peer_id not in self.discovered_peers:
-                self.discovered_peers.add(peer_id)
-                print(f"✓ Discovered peer: {peer_id}")
+            if peer_id:
+                is_new = peer_id not in self.discovered_peers
+                if is_new:
+                    self.discovered_peers.add(peer_id)
+                    print(f"✓ Discovered peer: {peer_id}")
                 if self.on_peer_found:
                     try:
                         self.on_peer_found(peer_id, peer_ip, peer_port)

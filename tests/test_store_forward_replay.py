@@ -4,6 +4,7 @@ import pytest
 
 from p2p.protocol import create_envelope
 from p2p.reliability import ReliableReceiver, ReliableSender
+from p2p.security import SecurityContext, generate_aes_key
 from p2p.store_forward import QueuedMessage, StoreForwardQueue
 from p2p.store_forward_manager import StoreForwardManager
 from p2p.transport import MockTransport
@@ -15,6 +16,38 @@ class DummyRouteManager:
 
     def route_available(self, destination: str) -> bool:
         return self.available
+
+
+def test_encrypted_store_forward_replay(tmp_path):
+    key = generate_aes_key()
+    sender_security = SecurityContext('A', key)
+    receiver_security = SecurityContext('E', key)
+    receiver_security.trust_peer('A', sender_security.public_key_bytes())
+    transport = MockTransport()
+    received = []
+    ReliableReceiver('E', transport, lambda message, address: received.append(message['payload']), security=receiver_security)
+    sender = ReliableSender('A', transport, timeout=0.05, max_retries=1, security=sender_security)
+    route = DummyRouteManager(False)
+    queue = StoreForwardQueue(str(tmp_path / 'encrypted-replay.sqlite'), max_messages=10)
+    manager = StoreForwardManager(queue=queue, reliable_sender=sender, route_manager=route)
+
+    queued = manager.send('E', {'value': 'encrypted and persistent'})
+    persisted = queue.get_pending('E')[0]
+
+    assert queued.status == 'QUEUED'
+    assert persisted.message_id == queued.message_id
+    assert persisted.envelope['payload'] != {'value': 'encrypted and persistent'}
+    assert 'security' in persisted.envelope['payload']
+
+    route.available = True
+    results = manager.replay('E')
+
+    assert results[0].status == 'DELIVERED'
+    assert results[0].message_id == queued.message_id
+    assert sender.last_message_id == queued.message_id
+    assert received == [{'value': 'encrypted and persistent'}]
+    assert queue.pending_count('E') == 0
+    queue.close()
 
 
 def test_queued_message_replays_after_route_recovery(tmp_path):

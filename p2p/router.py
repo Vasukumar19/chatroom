@@ -33,11 +33,17 @@ class Router:
 
     def send(self, destination: str, payload: dict, msg_type: str = 'data'):
         env = create_envelope(msg_type, source=self.node_id, payload=payload, destination=destination)
-        nh = self.routing_table.get_next_hop(destination)
-        if not nh:
+        route = self.routing_table.get_route(destination)
+        if not route:
             raise RuntimeError('No route to destination')
-        _, ip, port = nh
-        self.transport.send((ip, port), env)
+        self._send_on_route(route, env)
+
+    def _send_on_route(self, route, message):
+        address = (route.ip, route.port)
+        if route.transport and hasattr(self.transport, 'send_via'):
+            self.transport.send_via(route.transport, address, message)
+        else:
+            self.transport.send(address, message)
 
     def _on_transport_message(self, msg, addr):
         # validate
@@ -82,13 +88,12 @@ class Router:
             return
 
         # lookup next hop
-        nh = self.routing_table.get_next_hop(dest) if dest else None
-        if not nh:
+        route = self.routing_table.get_route(dest) if dest else None
+        if not route:
             # no route or next hop unavailable
             return
-        _, ip, port = nh
         try:
-            self.transport.send((ip, port), msg)
+            self._send_on_route(route, msg)
         except Exception:
             pass
 

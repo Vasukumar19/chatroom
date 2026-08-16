@@ -24,12 +24,16 @@ class ReliableSender:
         timeout: float = 0.25,
         max_retries: int = 3,
         on_failed: Optional[Callable[[str], None]] = None,
+        security=None,
+        address_resolver: Optional[Callable[[str], Tuple[str, int]]] = None,
     ):
         self.node_id = node_id
         self.transport = transport
         self.timeout = float(timeout)
         self.max_retries = int(max_retries)
         self.on_failed = on_failed
+        self.security = security
+        self.address_resolver = address_resolver
         self._lock = threading.Lock()
         self._pending: Dict[str, Dict[str, object]] = {}
         self._pending_events: Dict[str, threading.Event] = {}
@@ -43,10 +47,16 @@ class ReliableSender:
 
     def send(self, destination: str, payload: Dict[str, object], message_id: Optional[str] = None) -> bool:
         message_id = message_id or f"{self.node_id}:{int(time.time() * 1000000)}:{len(self._pending)}"
-        self.last_message_id = message_id
-        self.last_status = 'SENT'
-        self.retry_count = 0
+        env = self.prepare_envelope(destination, payload, message_id=message_id)
+        return self.send_envelope(destination, env)
 
+    def prepare_envelope(self, destination: str, payload: Dict[str, object], message_id: Optional[str] = None) -> Dict[str, object]:
+        """Create an outbound envelope without transmitting it.
+
+        Store-and-forward uses this to persist ciphertext rather than plaintext
+        and later replay the exact authenticated envelope.
+        """
+        message_id = message_id or f"{self.node_id}:{int(time.time() * 1000000)}:{len(self._pending)}"
         env = create_envelope(
             'data',
             source=self.node_id,
@@ -55,12 +65,24 @@ class ReliableSender:
             message_id=message_id,
         )
         env['delivery_attempt'] = 0
+        if self.security:
+            env = self.security.protect(env)
+        return env
+
+    def send_envelope(self, destination: str, env: Dict[str, object]) -> bool:
+        """Transmit a previously prepared envelope, retaining its identity."""
+        message_id = env.get('message_id')
+        if not message_id:
+            raise ValueError('Envelope must include message_id')
+        self.last_message_id = message_id
+        self.last_status = 'SENT'
+        self.retry_count = 0
         event = threading.Event()
 
         with self._lock:
             self._pending[message_id] = {
                 'destination': destination,
-                'payload': payload,
+                'payload': env.get('payload', {}),
                 'env': env,
                 'retries': 0,
                 'deadline': time.time() + self.timeout,
@@ -68,8 +90,15 @@ class ReliableSender:
             }
             self._pending_events[message_id] = event
 
-        address = destination if isinstance(destination, tuple) else (destination, 0)
-        self.transport.send(address, env)
+        address = self._address_for(destination)
+        try:
+            self.transport.send(address, env)
+        except Exception:
+            with self._lock:
+                self._pending.pop(message_id, None)
+                self._pending_events.pop(message_id, None)
+                self.last_status = 'FAILED'
+            return False
         return self._wait_for_ack(message_id, event)
 
     def _wait_for_ack(self, message_id: str, event: threading.Event) -> bool:
@@ -124,14 +153,28 @@ class ReliableSender:
                 self.last_status = 'RETRYING'
                 destination = pending['destination']
                 env = pending['env']
-                address = destination if isinstance(destination, tuple) else (destination, 0)
+                address = self._address_for(destination)
 
             event.clear()
-            self.transport.send(address, env)
+            try:
+                self.transport.send(address, env)
+            except Exception:
+                with self._lock:
+                    self._pending.pop(message_id, None)
+                    self._pending_events.pop(message_id, None)
+                    self.last_status = 'FAILED'
+                return False
 
         if failed_callback:
             failed_callback(message_id)
         return False
+
+    def _address_for(self, destination):
+        if isinstance(destination, tuple):
+            return destination
+        if self.address_resolver:
+            return self.address_resolver(destination)
+        return (destination, 0)
 
     def _on_transport_message(self, msg, addr):
         try:
@@ -170,10 +213,14 @@ class ReliableReceiver:
         app_handler: Optional[Callable[[dict, tuple], None]] = None,
         *,
         auto_register: bool = True,
+        security=None,
+        ack_sender: Optional[Callable[[dict, str], None]] = None,
     ):
         self.node_id = node_id
         self.transport = transport
         self.app_handler = app_handler
+        self.security = security
+        self.ack_sender = ack_sender
         self.processed_message_ids: Set[str] = set()
         self._lock = threading.Lock()
         self._transport_handler = self._on_transport_message
@@ -191,6 +238,17 @@ class ReliableReceiver:
 
         if msg.get('type') != 'data':
             return
+
+        if msg.get('destination') != self.node_id:
+            return
+
+        if getattr(self, 'security', None):
+            try:
+                # Reliability owns duplicate delivery and must still ACK a retry.
+                # SecurityContext's direct API retains strict replay rejection.
+                msg = self.security.open(msg, reject_replay=False)
+            except Exception:
+                return
 
         message_id = msg.get('message_id')
         if not message_id:
@@ -210,10 +268,7 @@ class ReliableReceiver:
                 self.processed_message_ids.add(message_id)
 
         if is_duplicate:
-            try:
-                self.transport.send((addr[0], addr[1]), ack)
-            except Exception:
-                pass
+            self._send_ack(ack, addr)
             return
 
         payload = msg.get('payload', {})
@@ -223,7 +278,13 @@ class ReliableReceiver:
             except Exception:
                 pass
 
+        self._send_ack(ack, addr)
+
+    def _send_ack(self, ack, addr):
         try:
-            self.transport.send((addr[0], addr[1]), ack)
+            if self.ack_sender:
+                self.ack_sender(ack, ack.get('destination'))
+            else:
+                self.transport.send((addr[0], addr[1]), ack)
         except Exception:
             pass

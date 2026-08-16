@@ -5,7 +5,9 @@ import socket
 import json
 import threading
 import uuid
-from typing import Callable, Dict, Tuple, List
+from typing import Callable, Dict, Optional, Tuple, List, Set
+
+from p2p.identity import load_or_create_identity
 
 
 VERBOSE = os.getenv("DC_VERBOSE") == "1"
@@ -19,12 +21,19 @@ def debug(msg: str):
 class P2PHost:
     """P2P Host for peer-to-peer communication with improved reliability"""
     
-    def __init__(self, port: int):
+    def __init__(self, port: int, *, identity_dir: Optional[str] = None):
         self.port = port
-        self.peer_id = str(uuid.uuid4())[:8]
+        # Load persistent identity if a storage directory is provided;
+        # fall back to a transient uuid for tests that don't need persistence.
+        if identity_dir is not None:
+            self.peer_id = load_or_create_identity(identity_dir)
+        else:
+            self.peer_id = str(uuid.uuid4())[:8]
         self.peers: Dict[str, Tuple[str, int]] = {}
+        self.known_peers: Set[str] = set()
         self.peer_failures: Dict[str, int] = {}
         self.message_handlers: List[Callable] = []
+        self.transport_handlers: List[Callable] = []
         self.running = False
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -97,6 +106,8 @@ class P2PHost:
                     peer_port = message.get('peer_port')
                     if peer_id and peer_port:
                         with self.peer_lock:
+                            if peer_id != self.peer_id:
+                                self.known_peers.add(peer_id)
                             if peer_id not in self.peers:
                                 self.peers[peer_id] = (address[0], int(peer_port))
                                 self.peer_failures[peer_id] = 0
@@ -112,6 +123,11 @@ class P2PHost:
                         print(f"⚠️  Message handler error: {e}")
                         import traceback
                         traceback.print_exc()
+                for handler in list(self.transport_handlers):
+                    try:
+                        handler(message, address)
+                    except Exception as e:
+                        debug(f"Transport handler error: {e}")
         except json.JSONDecodeError as e:
             print(f"⚠️  Invalid JSON received: {e}")
         except Exception as e:
@@ -126,6 +142,8 @@ class P2PHost:
         """Connect to a discovered peer"""
         try:
             with self.peer_lock:
+                if peer_id and peer_id != self.peer_id:
+                    self.known_peers.add(peer_id)
                 # Don't re-add if already connected
                 if peer_id in self.peers:
                     debug(f"Peer {peer_id} already in peer list")
@@ -239,11 +257,28 @@ class P2PHost:
                         self.peer_failures.pop(peer_id, None)
                         print(f"⚠️  Peer {peer_id} removed after broadcast failures")
         return successful_sends
+
+    def send_to_address(self, address: Tuple[str, int], message: dict) -> None:
+        """Send one JSON message to an explicit TCP next-hop address."""
+        peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            peer_socket.settimeout(3.0)
+            peer_socket.connect(address)
+            peer_socket.send(json.dumps(message).encode('utf-8'))
+        finally:
+            try:
+                peer_socket.close()
+            except Exception:
+                pass
     
     def add_message_handler(self, handler: Callable):
         """Add a message handler callback"""
         self.message_handlers.append(handler)
         print(f"🔧 DEBUG: Message handler added. Total handlers: {len(self.message_handlers)}")
+
+    def add_transport_handler(self, handler: Callable) -> None:
+        if handler not in self.transport_handlers:
+            self.transport_handlers.append(handler)
 
     def set_transport(self, transport):
         """Set a transport (e.g., UDPTransport) to use for sending/receiving."""
@@ -264,6 +299,9 @@ class P2PHost:
 
             # Update peer failure/reset if peer_id present
             peer_id = message.get('peer_id')
+            if peer_id and peer_id != self.peer_id:
+                with self.peer_lock:
+                    self.known_peers.add(peer_id)
             if peer_id and peer_id in self.peer_failures:
                 self.peer_failures[peer_id] = 0
 
@@ -284,6 +322,11 @@ class P2PHost:
         """Get copy of connected peers dictionary"""
         with self.peer_lock:
             return self.peers.copy()
+
+    def get_known_peers(self) -> Set[str]:
+        """Get copy of all known peer IDs (historical/session-level)"""
+        with self.peer_lock:
+            return self.known_peers.copy()
     
     def stop(self):
         """Stop the P2P host"""
@@ -294,8 +337,18 @@ class P2PHost:
             pass
 
 
-def create_host(port: int) -> P2PHost:
-    """Create and start a P2P host"""
-    host = P2PHost(port)
+def create_host(port: int, *, identity_dir: Optional[str] = None) -> P2PHost:
+    """Create and start a P2P host.
+
+    Parameters
+    ----------
+    port:
+        TCP port to bind to.
+    identity_dir:
+        Directory used to persist the node identity (``peer_identity.json``).
+        When provided the same peer_id is reused across restarts.  When
+        omitted a fresh transient id is generated (useful for tests).
+    """
+    host = P2PHost(port, identity_dir=identity_dir)
     host.start()
     return host

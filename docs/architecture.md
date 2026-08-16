@@ -1,28 +1,33 @@
-# MeshChat (DisasterConnect) - Baseline Architecture
+# DisasterConnect architecture
 
-This document captures the current baseline architecture before evolving DisasterConnect
-into MeshChat. It is intentionally brief and factual to serve as a starting point.
+```mermaid
+flowchart TB
+    application[Application]
+    security[Security / identity]
+    reliability[Reliable delivery]
+    persistence[Store-and-forward]
+    routing[Adaptive routing]
+    transports[Transport interface]
 
-## Current State (baseline)
-- Python-based CLI and Flask HTTP API
-- P2P components in `p2p/` using UDP broadcast for discovery and TCP for messaging
-- `p2p/host.py` — basic TCP peer host and broadcast helper
-- `p2p/discovery.py` — UDP broadcast discovery service
-- `p2p/chatroom.py` — in-memory chatroom and message handling
+    application --> security --> reliability --> persistence --> routing --> transports
+    transports --> ethernet[Ethernet / UDP]
+    transports --> bluetooth[Bluetooth-style simulated link]
+    transports --> wifi[Wi-Fi Direct-style simulated link]
+```
 
-## High-level components
-- CLI interface: `cli_interface.py`
-- HTTP API: `main.py` (Flask)
-- Networking: `p2p/` (host, discovery, chatroom)
+## Layer responsibilities
 
-## Known limitations
-- No formal protocol model or schema (message formats are ad-hoc dicts)
-- No transport abstraction
-- No tests currently exist
-- No persistent storage
-- No git repository found at time of inspection
+| Layer | Responsibility |
+| --- | --- |
+| Security | AES-GCM payload protection, Ed25519 signatures, trusted peers, replay detection. |
+| Reliable delivery | ACK correlation, bounded retry, and exactly-once application processing. |
+| Store-and-forward | Persists an already-protected envelope in SQLite until a route is available. |
+| Routing | Chooses an active next hop and optional link type; decrements TTL on forwarding. |
+| Transport | Presents one send/register-handler API over one or more adapters. |
 
-## Next steps (see roadmap)
-- Establish formal message envelope
-- Add transport abstraction and tests
-- Introduce peer manager and routing
+## Boundary rules
+
+- Routers do not decrypt application payloads.
+- TTL and hop count are mutable routing fields and are excluded from the end-to-end signature.
+- A replayed envelope is rejected by `SecurityContext`; a legitimate reliable retry is ACKed but reaches the application only once.
+- The Ethernet, Bluetooth-style, and Wi-Fi Direct-style adapters used by the benchmark are deterministic mock links, not OS or hardware implementations.

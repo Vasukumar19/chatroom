@@ -70,6 +70,90 @@ class MockTransport(Transport):
         self.handlers.append(handler)
 
 
+class _NamedMockTransport(MockTransport):
+    """Base class for simulated link technologies.
+
+    These classes intentionally have the same synchronous behaviour as
+    ``MockTransport``.  They identify a link type for routing and benchmarks;
+    they do not claim to emulate a real Bluetooth or Wi-Fi Direct radio.
+    """
+
+    name = 'mock'
+
+
+class MockEthernetTransport(_NamedMockTransport):
+    name = 'ethernet'
+
+
+class MockBluetoothTransport(_NamedMockTransport):
+    name = 'bluetooth'
+
+
+class MockWiFiDirectTransport(_NamedMockTransport):
+    name = 'wifi_direct'
+
+
+class MultiTransport(Transport):
+    """One transport-facing API backed by multiple link adapters.
+
+    A router normally calls :meth:`send_via` after its route selects a link.
+    ``send`` remains available for legacy users and uses ``default_transport``.
+    Incoming data from every registered adapter is exposed through the same
+    handler list, so routing is independent of the physical link.
+    """
+
+    def __init__(self, transports: Dict[str, Transport], *, default_transport: Optional[str] = None):
+        if not transports:
+            raise ValueError('MultiTransport requires at least one transport')
+        self.transports = dict(transports)
+        self.default_transport = default_transport or next(iter(self.transports))
+        if self.default_transport not in self.transports:
+            raise ValueError('default_transport is not registered')
+        self.handlers = []
+
+    def start(self) -> None:
+        for transport in self.transports.values():
+            transport.start()
+
+    def stop(self) -> None:
+        for transport in self.transports.values():
+            transport.stop()
+
+    def send(self, address: Tuple[str, int], message: Dict[str, Any]) -> None:
+        self.send_via(self.default_transport, address, message)
+
+    def send_via(self, transport_name: str, address: Tuple[str, int], message: Dict[str, Any]) -> None:
+        try:
+            transport = self.transports[transport_name]
+        except KeyError as exc:
+            raise ValueError(f'Unknown transport: {transport_name}') from exc
+        transport.send(address, message)
+
+    def register_handler(self, handler: Callable[[Dict[str, Any], Tuple[str, int]], None]) -> None:
+        self.handlers.append(handler)
+        for transport in self.transports.values():
+            transport.register_handler(handler)
+
+
+class HostTransport(Transport):
+    """Transport adapter for the existing TCP ``P2PHost``."""
+
+    def __init__(self, host):
+        self.host = host
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def send(self, address: Tuple[str, int], message: Dict[str, Any]) -> None:
+        self.host.send_to_address(address, message)
+
+    def register_handler(self, handler: Callable[[Dict[str, Any], Tuple[str, int]], None]) -> None:
+        self.host.add_transport_handler(handler)
+
+
 class UDPTransport(Transport):
     """A hardened UDP transport wrapper.
 

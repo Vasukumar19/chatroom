@@ -1,17 +1,17 @@
 import pytest
 from p2p.chatroom import ChatMessage, ChatRoom
+from p2p.store_forward_manager import DeliveryResult
 
 
 class DummyHost:
-    def __init__(self):
+    def __init__(self, peers=None):
         self.handlers = []
+        self.peers = list(peers or ['peer-1'])
 
     def add_message_handler(self, handler):
         self.handlers.append(handler)
 
     def broadcast_message(self, message):
-        # Simulate at least one successful send
-        # Also simulate immediate delivery to registered handlers for local testing
         for h in list(self.handlers):
             try:
                 h(message)
@@ -19,8 +19,23 @@ class DummyHost:
                 pass
         return 1
 
+    def get_peers(self):
+        return list(self.peers)
+
     def get_peer_count(self):
-        return 0
+        return len(self.peers)
+
+
+class DummyDeliveryManager:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, destination, payload):
+        self.sent.append((destination, payload))
+        return DeliveryResult(
+            status="DELIVERED",
+            message_id=payload["data"]["MessageID"],
+        )
 
 
 def test_chatmessage_defaults():
@@ -34,12 +49,15 @@ def test_chatmessage_defaults():
 
 def test_chatroom_publish_and_receive():
     host = DummyHost()
-    room = ChatRoom('testroom', 'Me', 'me-id', host)
+    manager = DummyDeliveryManager()
+    room = ChatRoom('testroom', 'Me', 'me-id', host, delivery_manager=manager)
 
-    # Publish a message
     ok = room.publish('hey there')
     assert ok is True
 
     msgs = room.get_raw_messages()
     assert len(msgs) == 1
     assert msgs[0]['Message'] == 'hey there'
+    assert len(manager.sent) == 1
+    assert manager.sent[0][0] == 'peer-1'
+    assert manager.sent[0][1]['data']['Message'] == 'hey there'
