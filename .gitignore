@@ -23,3 +23,6 @@ venv/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+# Local node identity (MUST stay per-machine; never commit this file,
+# or every clone of the repo will boot with the same peer_id)
+peer_identity.json
