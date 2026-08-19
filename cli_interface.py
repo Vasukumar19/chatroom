@@ -49,8 +49,13 @@ class TerminalInterface:
                 # Send message
                 try:
                     success = self.chat_room.publish(message)
+                    delivery_status = getattr(self.chat_room, 'last_publish_status', 'UNKNOWN')
                     # Display exactly one line for the sender
-                    if not success:
+                    if delivery_status == 'NO_KNOWN_PEERS':
+                        print(f"[{self.nickname}] {message} (saved locally, no known peers yet)")
+                    elif delivery_status == 'QUEUED':
+                        print(f"[{self.nickname}] {message} (queued for offline delivery)")
+                    elif not success:
                         print(f"[{self.nickname}] {message} (saved locally, no peers yet)")
                 except Exception as e:
                     print(f"❌ Send error: {e}")

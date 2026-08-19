@@ -24,6 +24,7 @@ class ReliableSender:
         timeout: float = 0.25,
         max_retries: int = 3,
         on_failed: Optional[Callable[[str], None]] = None,
+        on_late_ack: Optional[Callable[[str, str], None]] = None,
         security=None,
         address_resolver: Optional[Callable[[str], Tuple[str, int]]] = None,
     ):
@@ -32,11 +33,23 @@ class ReliableSender:
         self.timeout = float(timeout)
         self.max_retries = int(max_retries)
         self.on_failed = on_failed
+        # Fired when an ACK arrives for a message_id we already gave up
+        # waiting on (see `_abandoned` below). Signature: (message_id, destination).
+        self.on_late_ack = on_late_ack
         self.security = security
         self.address_resolver = address_resolver
         self._lock = threading.Lock()
         self._pending: Dict[str, Dict[str, object]] = {}
         self._pending_events: Dict[str, threading.Event] = {}
+        # Messages whose synchronous wait exhausted retries and was reported
+        # FAILED to the caller, but whose ACK may still legitimately arrive
+        # afterwards (the destination *did* process it in time -- only our
+        # local wait window was too short). Keyed by message_id -> {
+        # 'destination': ..., 'abandoned_at': time.time()}. Bounded by
+        # `_abandoned_ttl` so a permanently-unreachable destination doesn't
+        # grow this dict without limit.
+        self._abandoned: Dict[str, Dict[str, object]] = {}
+        self._abandoned_ttl = 120.0
         self.last_status = 'CREATED'
         self.last_message_id: Optional[str] = None
         self.retry_count = 0
@@ -142,6 +155,7 @@ class ReliableSender:
                     self.last_status = 'FAILED'
                     self._pending.pop(message_id, None)
                     self._pending_events.pop(message_id, None)
+                    self._remember_abandoned_locked(message_id, pending['destination'])
                     failed_callback = self.on_failed
                     break
 
@@ -169,6 +183,16 @@ class ReliableSender:
             failed_callback(message_id)
         return False
 
+    def _remember_abandoned_locked(self, message_id: str, destination: str) -> None:
+        """Record a message we gave up waiting on. Caller must hold `self._lock`."""
+        now = time.time()
+        if self._abandoned:
+            cutoff = now - self._abandoned_ttl
+            expired = [mid for mid, info in self._abandoned.items() if info['abandoned_at'] < cutoff]
+            for mid in expired:
+                self._abandoned.pop(mid, None)
+        self._abandoned[message_id] = {'destination': destination, 'abandoned_at': now}
+
     def _address_for(self, destination):
         if isinstance(destination, tuple):
             return destination
@@ -189,12 +213,30 @@ class ReliableSender:
         if not ack_id:
             return
 
+        late_ack_destination = None
         with self._lock:
             pending = self._pending.get(ack_id)
             if pending is None:
-                return
-            pending['status'] = 'ACKED'
-            event = self._pending_events.get(ack_id)
+                abandoned = self._abandoned.pop(ack_id, None)
+                if abandoned is not None:
+                    late_ack_destination = abandoned['destination']
+                event = None
+            else:
+                pending['status'] = 'ACKED'
+                event = self._pending_events.get(ack_id)
+
+        if pending is None:
+            # Either a genuinely unknown/stale ack (nothing to do), or a late
+            # ack for a message we already gave up on. In the latter case the
+            # destination really did receive and process it -- tell whoever
+            # is tracking delivery state (e.g. StoreForwardManager) so it can
+            # mark the message delivered without waiting for another replay.
+            if late_ack_destination is not None and self.on_late_ack:
+                try:
+                    self.on_late_ack(ack_id, late_ack_destination)
+                except Exception:
+                    pass
+            return
 
         self.last_status = 'ACKED'
         self.last_message_id = ack_id

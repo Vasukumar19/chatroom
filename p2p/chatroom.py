@@ -47,7 +47,22 @@ class ChatRoom:
         self.messages: List[ChatMessage] = []
         self.message_lock = threading.Lock()
         self.seen_message_ids: Set[str] = set()
-        
+
+        # Set by publish() on every call so callers (HTTP API, CLI) can
+        # report an accurate outcome without changing publish()'s existing
+        # bool return contract (kept for backward compatibility -- several
+        # tests assert `publish(...) is True`). One of:
+        #   'NO_KNOWN_PEERS' -- there is no destination at all; nothing was
+        #                       queued for reliable delivery because there is
+        #                       nothing to queue it for (Case B).
+        #   'QUEUED'         -- at least one known peer is currently
+        #                       unreachable; persisted in StoreForwardQueue
+        #                       with destination=<peer_id>, state=QUEUED
+        #                       (Case A).
+        #   'DELIVERED'      -- every known peer received it immediately.
+        #   'FAILED'         -- delivery/queueing genuinely failed.
+        self.last_publish_status = 'UNKNOWN'
+
         # Message handling is now managed by the ReliableReceiver, which is
         # registered with the Router. This ensures all incoming messages go
         # through the ACK and deduplication layer.
@@ -105,7 +120,12 @@ class ChatRoom:
                     target_peers = [p for p in peers_raw if p != self.peer_id]
 
             if not target_peers:
-                # Successfully sent to zero peers.
+                # Case B: there has never been a known peer. Nothing was
+                # queued for reliable delivery because there is no
+                # destination to queue it for -- this is trivially
+                # "successful" (nothing failed) but callers must not report
+                # it as if a delivery/queue actually happened.
+                self.last_publish_status = 'NO_KNOWN_PEERS'
                 return True
 
             results = [
@@ -113,11 +133,23 @@ class ChatRoom:
                 for peer_id in target_peers
             ]
 
+            statuses = {res.status for res in results}
+            if statuses <= {'DELIVERED'}:
+                self.last_publish_status = 'DELIVERED'
+            elif statuses <= {'DELIVERED', 'QUEUED'}:
+                # Case A: at least one known peer is currently unreachable
+                # and the message was persisted in StoreForwardQueue with
+                # destination=<peer_id>, state=QUEUED.
+                self.last_publish_status = 'QUEUED'
+            else:
+                self.last_publish_status = 'FAILED'
+
             # A message is successfully published if it was delivered or queued for all.
             return all(res.status in ('DELIVERED', 'QUEUED') for res in results)
                 
         except Exception as e:
             print(f"❌ Failed to send: {e}")
+            self.last_publish_status = 'FAILED'
             return False
     
     def _handle_incoming_message(self, message_data: dict):

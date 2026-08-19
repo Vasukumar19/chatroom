@@ -27,6 +27,21 @@ class StoreForwardManager:
         self.db_path = db_path
         self.max_messages = max_messages
         self._message_id_counter = 0
+        # If the sender supports it, learn about ACKs that arrive after it
+        # already gave up waiting (see ReliableSender._abandoned). This is
+        # what lets a queued message reach DELIVERED promptly even when the
+        # synchronous send_envelope() call timed out despite the destination
+        # having genuinely processed the message and ACKed it.
+        if self.reliable_sender is not None and hasattr(self.reliable_sender, "on_late_ack"):
+            self.reliable_sender.on_late_ack = self._on_late_ack
+
+    def _on_late_ack(self, message_id: str, destination: str) -> None:
+        if self.queue is None:
+            return
+        try:
+            self.queue.mark_delivered(message_id)
+        except Exception:
+            pass
 
     def _make_message_id(self, destination: str) -> str:
         self._message_id_counter += 1

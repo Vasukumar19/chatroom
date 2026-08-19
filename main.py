@@ -44,16 +44,44 @@ store_forward_queue = None
 
 
 def find_free_port(start_port=5000, max_attempts=100):
-    """Find an available port automatically"""
+    """Find an available port and hold it reserved.
+
+    Returns (port, reservation_socket). The original implementation checked a
+    port by binding a throwaway socket and immediately closing it, then
+    returned only the port number. Real binding (P2PHost.start() / Flask's
+    app.run()) can happen several seconds later -- initialize_p2p() alone has
+    multiple sleep(0.5) calls between port selection and the P2P socket bind,
+    and the HTTP port isn't bound until run_flask() is called afterwards.
+    During that gap the "reserved" port was not actually held by the OS, so a
+    second DisasterConnect instance starting around the same time could have
+    its own find_free_port() scan select and bind the exact same port number
+    (observed live: one instance's P2P port landed on another instance's
+    not-yet-bound HTTP port, which then failed to start).
+
+    The caller MUST keep `reservation_socket` open for as long as possible
+    and close it only immediately before creating the real listener on that
+    same port -- closing it early re-opens the same race this exists to
+    prevent.
+    """
     for port in range(start_port, start_port + max_attempts):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.bind(('', port))
-            sock.close()
-            return port
         except OSError:
+            sock.close()
             continue
+        return port, sock
     raise RuntimeError(f"No available ports found in range {start_port}-{start_port + max_attempts}")
+
+
+def _release_port_reservation(reservation_socket):
+    """Close a port reservation socket right before its real listener binds."""
+    if reservation_socket is None:
+        return
+    try:
+        reservation_socket.close()
+    except Exception:
+        pass
 
 
 def get_user_input():
@@ -138,10 +166,21 @@ def send_message():
             }), 503
         
         success = chat_room.publish(message)
-        
+        delivery_status = getattr(chat_room, 'last_publish_status', 'UNKNOWN')
+
+        if delivery_status == 'NO_KNOWN_PEERS':
+            response_message = "Message saved locally (no known peers yet -- nothing queued for delivery)"
+        elif delivery_status == 'QUEUED':
+            response_message = "Message queued for offline delivery to known peer(s)"
+        elif delivery_status == 'DELIVERED':
+            response_message = "Message sent"
+        else:
+            response_message = "Message sent" if success else "Message saved (no peers connected)"
+
         return jsonify({
             "status": "success",
-            "message": "Message sent" if success else "Message saved (no peers connected)"
+            "message": response_message,
+            "delivery_status": delivery_status
         }), 200
             
     except Exception as e:
@@ -224,7 +263,7 @@ def on_peer_discovered(peer_id: str, peer_ip: str, peer_port: int):
         store_forward_manager.on_route_recovered(peer_id)
 
 
-def initialize_p2p(p2p_port: int, room_name: str, nickname: str):
+def initialize_p2p(p2p_port: int, room_name: str, nickname: str, *, p2p_port_reservation=None):
     """Initialize complete P2P chat system"""
     global p2p_host, chat_room, peer_discovery, terminal_interface
     global transport, routing_table, router, reliable_sender, reliable_receiver
@@ -239,6 +278,11 @@ def initialize_p2p(p2p_port: int, room_name: str, nickname: str):
     # Use the current working directory as the stable identity directory so
     # that peer_identity.json survives restarts on the same machine.
     identity_dir = os.getcwd()
+    # Release the port reservation as late as possible -- immediately before
+    # create_host() binds the real listening socket on the same port -- to
+    # keep the window another process could steal this port in as small as
+    # possible. See find_free_port() for why this matters.
+    _release_port_reservation(p2p_port_reservation)
     p2p_host = create_host(p2p_port, identity_dir=identity_dir)
     time.sleep(0.5)
 
@@ -311,13 +355,18 @@ def initialize_p2p(p2p_port: int, room_name: str, nickname: str):
     print("═"*70)
 
 
-def run_flask(http_port: int):
+def run_flask(http_port: int, *, http_port_reservation=None):
     """Start HTTP API server"""
     print(f"\n🌐 HTTP API Server: http://localhost:{http_port}")
     print(f"   └─ Connect your web interface here")
     print(f"\n💡 Tip: Other devices can join by running this app with the same room name")
     print(f"⚠️  Press Ctrl+C to stop\n")
-    
+
+    # This was previously released the moment the port was selected, up to
+    # several seconds (and multiple sleep(0.5) calls in initialize_p2p())
+    # before this bind actually happened -- see find_free_port().
+    _release_port_reservation(http_port_reservation)
+
     try:
         app.run(
             host='0.0.0.0',
@@ -337,19 +386,22 @@ if __name__ == '__main__':
         # Welcome and get user input
         room_name, nickname = get_user_input()
         
-        # Find available ports automatically
+        # Find available ports automatically. Both ports are held reserved
+        # (bound, not yet listening) from this point until each is actually
+        # used below, so a concurrently-starting second instance cannot
+        # select either one out from under us in the meantime.
         print("\n🔍 Finding available ports...")
-        p2p_port = find_free_port(5000)
-        http_port = find_free_port(p2p_port + 1)
+        p2p_port, p2p_port_reservation = find_free_port(5000)
+        http_port, http_port_reservation = find_free_port(p2p_port + 1)
         
         print(f"✓ P2P Port: {p2p_port}")
         print(f"✓ HTTP Port: {http_port}")
         
         # Initialize P2P system
-        initialize_p2p(p2p_port, room_name, nickname)
+        initialize_p2p(p2p_port, room_name, nickname, p2p_port_reservation=p2p_port_reservation)
         
         # Start HTTP server (blocking call)
-        run_flask(http_port)
+        run_flask(http_port, http_port_reservation=http_port_reservation)
         
     except KeyboardInterrupt:
         print("\n\n" + "="*70)
