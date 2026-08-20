@@ -1,4 +1,6 @@
-# Phases 9–10: simulated heterogeneous links and end-to-end security
+# Phases 9–10: Simulated Heterogeneous Links and End-to-End Security
+
+> **Historical Document:** This document preserves the Phase 9–10 design and benchmark notes. For current production architecture and routing specifications, see [README.md](../README.md) and [docs/architecture.md](architecture.md).
 
 Phase 9 introduces a small `MultiTransport` adapter. A route may now include
 an optional `transport` name (`ethernet`, `bluetooth`, or `wifi_direct`), and

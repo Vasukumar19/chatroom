@@ -1,8 +1,10 @@
 # Phase 8: Performance Baseline Report
 
-**Date:** 2026-08-16  
-**Status:** ✅ Baseline Established  
-**Regression Tests:** 74/74 passing  
+> **Historical Document:** This document preserves the Phase 8 benchmark baseline recorded on in-memory mock transports. For current production architecture and test status, see [README.md](README.md) and [docs/architecture.md](docs/architecture.md).
+
+**Date:** 2026-08-16
+**Status:** ✅ Baseline Established
+**Regression Tests:** 74/74 passing (at Phase 8 baseline)
 
 ---
 

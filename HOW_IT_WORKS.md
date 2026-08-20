@@ -1,218 +1,185 @@
-# DisasterConnect / DisasterNet – How it works
+# DisasterConnect — How It Works (End-to-End System Walkthrough)
 
-This document explains the project end‑to‑end so you can run, debug, and extend it. It covers backend, P2P layer, HTTP API, CLI, and the React frontend.
-
-## What it is
-- Local‑network peer‑to‑peer (P2P) chat. No internet required; devices must be on the same LAN/Wi‑Fi.
-- Each device runs the same Python backend. Peers auto‑discover each other via UDP broadcast, then exchange messages over TCP.
-- A minimal React frontend calls the backend HTTP API to view/send messages.
-
-## High‑level architecture
-1) **Backend entry** (`main.py`): asks for room + nickname, finds free ports, starts P2P host, discovery, chat room, CLI, then Flask API.  
-2) **P2P stack** (`p2p/`):
-   - `host.py`: TCP server + peer list; handles handshakes and message broadcast/delivery.
-   - `discovery.py`: UDP broadcast/listen for peers (room‑scoped).
-   - `chatroom.py`: Message history, deduplication, and in/out processing.
-3) **CLI** (`cli_interface.py`): Terminal chat input/output (single line per send/receive).
-4) **HTTP API** (Flask in `main.py`): Exposes messages, peers, status for the frontend.
-5) **Frontend** (`frontend/src/App.js`): Polls `/messages` and POSTs `/send` to show/send chat.
-
-## Ports and IDs
-- **P2P TCP port**: auto‑picked (default search starts at 5000). Carries chat messages + handshakes.
-- **UDP discovery port**: 37020 (with fallback range +9). Broadcasts presence to find peers.
-- **HTTP port**: next free port after P2P (e.g., 5001).
-- **Peer ID**: short UUID per device (generated in `host.py`).
-
-## Detailed flow (per device)
-1) Start `python main.py`.  
-2) Prompt: enter `room_name` and `nickname`. Peers must share the same `room_name` to see each other.  
-3) Ports are auto‑selected.  
-4) `initialize_p2p`:
-   - `create_host` → starts TCP listener and registers message handlers.
-   - `init_mdns` (UDP broadcast/listen) → starts announcing and listening for peers in the same room.
-   - `join_chat_room` → wires message handling and history.
-   - `start_terminal_interface` → begins CLI input loop.
-5) Flask starts on the HTTP port (0.0.0.0) for web/REST access.
-
-## Peer discovery and connection
-- Every 5s, each node broadcasts a JSON `peer_announcement` via UDP to 255.255.255.255 on port 37020 (and the fallback port it bound).
-- On receiving an announcement with the same `rendezvous` (room), `on_peer_found` calls `connect_to_peer`.
-- `connect_to_peer` opens a TCP connection and sends a **handshake**: `{"type":"handshake","peer_id":<id>,"peer_port":<p2p_port>}`.
-- The receiver stores the sender’s IP/port and can now deliver/broadcast messages to it. Handshakes make peer lists symmetric.
-
-## Message send/receive path
-- CLI or HTTP `/send` calls `chat_room.publish(message)`.
-- `chatroom.py` creates a `ChatMessage` (unique `MessageID`, timestamp), stores it locally, and calls `p2p_host.broadcast_message`.
-- `host.py` sends the serialized message to every connected peer over TCP.
-- Receiving side’s `host.py` hands off to the registered handler in `chatroom.py`, which:
-  - Drops non‑chat or wrong‑room messages.
-  - Deduplicates via `MessageID`.
-  - Prints a single line to the CLI: `[SenderNick]: message`.
-- The sender’s CLI prints exactly one line for its own send: `[nickname] message` (or “saved locally” if no peers).
-
-## HTTP API (Flask)
-- `GET /messages` → list of formatted strings.
-- `GET /messages/raw` → full metadata objects.
-- `POST /send` → `{ "message": "text" }` sends a chat message.
-- `GET /peers` → current peer list + self_id.
-- `GET /health` → basic status.
-- `GET /room-info` / `GET /status` → room, nickname, peer counts, totals.
-
-## Frontend (React)
-- Polls `http://localhost:5001/messages` every 2s and renders bubbles.
-- Sends with `POST http://localhost:5001/send` (JSON body `{ message }`).
-- Files: `frontend/src/App.js`, `index.js`, styles in `App.css`/`index.css`.
-- To run: `cd frontend && npm install && npm start` (uses port 3000; ensure backend is running and CORS is enabled in Flask).
-
-## Controls, logging, and tuning
-- Quiet by default. Enable verbose logs by setting env var `DC_VERBOSE=1` before running.
-- Room isolation: only peers with the same room name will handshake and exchange messages.
-- If UDP port 37020 is busy, discovery falls back to the next available up to +9 and will log the chosen port.
-
-## Running on multiple laptops (same LAN)
-1) On each laptop: pull the same code revision.  
-2) Run `python main.py`, enter the same room name, choose nicknames.  
-3) Allow Windows/macOS firewall prompts for the chosen P2P port and for Python inbound.  
-4) Optionally start the React frontend pointing to the backend’s HTTP port (default 5001 on the same machine).  
-5) Send messages; each should appear once on all peers.
-
-## Troubleshooting quick checks
-- No peers: verify same room name, same LAN, firewall allows inbound on the P2P port, and UDP broadcast is not blocked by the router/AP.  
-- Messages one‑way: ensure all peers are on the updated build (handshake includes `peer_port`).  
-- Port conflicts: restart or set base ports manually (e.g., run backend with a free starting port by editing `find_free_port` defaults or exporting a custom env if you add one).  
-- Verbose diagnostics: `DC_VERBOSE=1 python main.py` shows discovery and send/broadcast details.
-
-## Key files map
-- `main.py` – entrypoint; wiring + Flask endpoints.
-- `p2p/host.py` – TCP host, peers, handshakes, broadcast/send.
-- `p2p/discovery.py` – UDP announce/listen, room filtering.
-- `p2p/chatroom.py` – message model, history, dedupe, handler.
-- `cli_interface.py` – terminal chat loop.
-- `frontend/src/App.js` – React UI polling `/messages` and POSTing `/send`.
-
-This should give you a complete mental model to run and extend the app. For deeper diagnostics, toggle `DC_VERBOSE`. For UI changes, adjust the React polling interval or switch to websockets if you later add them to the backend.
+This document provides a comprehensive technical walkthrough of the DisasterConnect runtime architecture, component lifecycle, multi-hop packet routing, reliability mechanics, anti-entropy partition reconciliation, and operational configuration.
 
 ---
 
-# Deeper, code-focused walkthrough (what runs and why)
+## 1. High-Level Architecture Overview
 
-Below is a concise, line-referenced narrative of how each core file behaves at runtime. It’s not every single line, but covers the important control flow and how parts interact.
+DisasterConnect operates as a resilient, decentralized peer-to-peer network capable of multi-hop routing across real TCP socket connections without central coordination or pre-existing infrastructure.
 
-## `main.py` (entrypoint, Flask API)
-- Top: imports Flask + CORS, P2P modules (`host`, `discovery`, `chatroom`), CLI interface.
-- Globals: `p2p_host`, `chat_room`, `peer_discovery`, `terminal_interface`.
-- `find_free_port`: iterates from a start port to find an available TCP port.
-- `get_user_input`: prompts for room name + nickname (ensures non-empty).
-- Flask routes:
-  - `/messages` → returns `chat_room.get_messages()` (string list) or `[]`.
-  - `/messages/raw` → returns `chat_room.get_raw_messages()` (dict list).
-  - `/send` (POST) → validates JSON, non-empty message, max length, requires `chat_room`; calls `chat_room.publish(message)`; returns success or saved-locally note.
-  - `/peers` → reports `self_id`, peer list (id + address), peer_count.
-  - `/health` → status, peer_id/room/message_count/connected_peers.
-  - `/room-info` / `/status` → room/nickname/peer_id/peer_count/total_messages.
-- Error handlers: 404/500 JSON responses.
-- `on_peer_discovered`: callback invoked by discovery; calls `p2p_host.connect_to_peer`.
-- `initialize_p2p`:
-  1) `create_host` → start TCP server and accept thread.
-  2) `init_mdns` → start UDP broadcast + listen threads for discovery.
-  3) `join_chat_room` → create ChatRoom, register message handler.
-  4) `start_terminal_interface` → start CLI input thread.
-- `run_flask`: starts Flask with host 0.0.0.0, chosen HTTP port, threaded.
-- `__main__` block: prompts user, finds free P2P/HTTP ports, runs initialize, then blocks in `run_flask`. KeyboardInterrupt triggers clean shutdown of CLI, discovery, host.
+```text
+               +----------------------------------------------------+
+               |                Application Layer                   |
+               |       (ChatRoom / CLI Interface / Flask API)       |
+               +----------------------------------------------------+
+                                         │
+                                         ▼
+               +----------------------------------------------------+
+               |               StoreForwardManager                  |
+               |          (SQLite Persistent Queue & Replay)        |
+               +----------------------------------------------------+
+                                         │
+                                         ▼
+               +----------------------------------------------------+
+               |                 ReliableSender                     |
+               |   (ACK Correlation, Retries, RTT EMA, Retry Rate)   |
+               +----------------------------------------------------+
+                                         │
+                                         ▼
+               +----------------------------------------------------+
+               |                PriorityTransport                   |
+               |    (QoS Priority Queues, Congestion Eviction)      |
+               +----------------------------------------------------+
+                                         │
+                                         ▼
+               +----------------------------------------------------+
+               |                     Router                         |
+               |  (Packet Forwarding, Loop Protection, TTL Decrement)|
+               +----------------------------------------------------+
+                     │                    │                    │
+                     ▼                    ▼                    ▼
+             +---------------+    +---------------+    +---------------+
+             | RoutingTable  |    | RouteLearner  |    |  SyncManager  |
+             | (Hysteresis,  |    | (Distance-    |    | (Anti-Entropy |
+             | Cost Metrics) |    | Vector Ads)   |    | Reconciliation|
+             +---------------+    +---------------+    +---------------+
+                                         │
+                                         ▼
+               +----------------------------------------------------+
+               |              HostTransport (TCP)                   |
+               |        + UDP Broadcast Peer Discovery              |
+               +----------------------------------------------------+
+```
 
-## `p2p/host.py` (TCP host, peers, handshakes, broadcast)
-- `P2PHost.__init__`: assigns port, generates `peer_id` (short UUID), sets up peer maps and TCP listening socket with SO_REUSEADDR.
-- `start`: binds to `0.0.0.0:port`, starts listening, launches `_listen_for_connections` thread; returns `peer_id`.
-- `_listen_for_connections`: accepts inbound TCP, sets timeout, spins `_handle_peer_connection` per client (thread).
-- `_handle_peer_connection`:
-  - Reads JSON message.
-  - Resets failure count for sender if known.
-  - If `type == handshake`: extracts `peer_id` and `peer_port`, stores `(addr, port)` in peer list (adds missing peers), enabling symmetric links.
-  - Calls every registered message handler with the parsed message.
-- `connect_to_peer(peer_ip, peer_port, peer_id)`:
-  - Adds peer to list if absent; sets failure counter.
-  - Sends handshake (`type: handshake, peer_id: self.peer_id, peer_port: self.port`) so the remote can add us.
-- `_send_to_peer`: TCP connect + send JSON; retries tracked; removes peer after 3 consecutive failures.
-- `broadcast_message`: sends a JSON payload (with `peer_id` injected) to all peers; tracks failures similarly.
-- `add_message_handler`: stores callbacks (ChatRoom registers here).
-- `get_peers` / `get_peer_count`: thread-safe snapshots.
-- `stop`: closes listening socket.
+---
 
-## `p2p/discovery.py` (UDP broadcast + listen)
-- Uses UDP broadcast port 37020 (with fallback up to +9).
-- `start(rendezvous)`:
-  - Records room name (`rendezvous`), marks running.
-  - Binds a UDP socket to the first available port in the range.
-  - Starts `_broadcast_presence` thread (daemon).
-  - Starts `_listen_for_peers` thread if binding succeeded.
-- `_broadcast_presence`: every 5s sends JSON `{type: "peer_announcement", peer_id, p2p_port, rendezvous}` to 255.255.255.255 on both the default and actual bound port.
-- `_listen_for_peers`:
-  - Receives UDP packets with timeout.
-  - Parses JSON; drops own announcements; drops other rooms.
-  - Extracts `peer_id`, `peer_port`, `peer_ip = addr[0]`.
-  - Deduplicates via `discovered_peers` set.
-  - On a new peer, calls `on_peer_found(peer_id, peer_ip, peer_port)` (provided by `main.py`), which triggers a TCP handshake via `host.connect_to_peer`.
-- `stop`: closes sockets.
+## 2. Component Initialization & Runtime Startup (`main.py`)
 
-## `p2p/chatroom.py` (message model, history, dedupe, handler)
-- `ChatMessage` dataclass: fields Message, SenderID, SenderNick, auto MessageID (uuid[:12]), Timestamp (ISO).
-- `ChatRoom.__init__`: stores room/nickname/peer_id, message list + locks + `seen_message_ids`; registers `_handle_incoming_message` as a handler with `p2p_host`.
-- `publish(message: str)`:
-  - Builds `ChatMessage`, appends to local history, tracks `MessageID`.
-  - Broadcasts via `p2p_host.broadcast_message` with envelope `{type: "chat_message", room, data: <chat dict>}`.
-  - Returns True if at least one peer send succeeded; False if none (but message still stored locally).
-- `_handle_incoming_message`:
-  - Only handles `type == chat_message` and matching `room`.
-  - Validates required fields; builds ChatMessage.
-  - Drops self-sent messages (SenderID == self.peer_id).
-  - Dedupes via `seen_message_ids`.
-  - On accept: append to history, then print once to CLI: `📥 SenderNick: Message` and re-print prompt prefix.
-- Accessors: `get_messages` (formatted strings), `get_raw_messages` (dicts), `get_message_count`, `get_peer_count` (from host), `get_room_info`.
+When `python main.py` is executed, the runtime performs the following startup sequence in `initialize_p2p()`:
 
-## `cli_interface.py` (terminal chat loop)
-- Starts a daemon thread reading user input.
-- Commands: type message → sends; `quit/exit/q` → stop; Ctrl+C → stop.
-- On send, prints exactly one line `[nickname] message` (or notes saved locally if no peers).
-- Incoming messages are printed by ChatRoom handler, not here.
+1. **Port Allocation & Socket Reservation:**
+   `find_free_port()` scans for an available TCP port and maintains an OS reservation socket to prevent port-stealing race conditions before the real listener binds.
+2. **P2P Host & Persistent Identity (`p2p/host.py`):**
+   Loads or generates a persistent cryptographic peer identity (`peer_identity.json`) and binds a TCP server listening socket on `0.0.0.0:<p2p_port>`.
+3. **Transport Layer (`p2p/transport.py`):**
+   Creates `HostTransport` wrapping the active TCP host.
+4. **QoS & Congestion Control (`p2p/qos.py`):**
+   Wraps `HostTransport` in a `PriorityTransport` queue worker thread with bounded capacity (`max_queue_size=100`) and high-priority packet scheduling.
+5. **Routing Engine & Data Model (`p2p/routing.py`, `p2p/router.py`):**
+   Instantiates `RoutingTable` and starts `Router` with loop detection and TTL validation.
+6. **Reliable Sender (`p2p/reliability.py`):**
+   Instantiates `ReliableSender` wired to `RoutingTable` next-hop address resolution. Tracks per-peer RTT Exponential Moving Averages ($\alpha=0.2$) and 20-sample sliding-window retry rates.
+7. **Store-and-Forward Persistence (`p2p/store_forward.py`, `p2p/store_forward_manager.py`):**
+   Initializes SQLite database `disasterconnect-<peer_id>.sqlite` and wires `StoreForwardManager` to receive route recovery notifications from `RoutingTable`.
+8. **Dynamic Route Learner & Peer Manager (`p2p/routemanager.py`, `p2p/peermanager.py`):**
+   Starts `PeerManager` (direct neighbor tracking) and `RouteLearner` (distance-vector route advertisement engine). `RouteLearner` listens for advertisements and computes dynamic link costs using RTT, retries, and queue pressure.
+9. **Partition Synchronization Manager (`p2p/sync.py`):**
+   Instantiates `SyncManager` wired to route recovery callbacks to trigger bidirectional anti-entropy reconciliation when disconnected segments rejoin.
+10. **Application Chat Room (`p2p/chatroom.py`):**
+    Initializes `ChatRoom` with message deduplication (`seen_message_ids`), wiring `ReliableReceiver` to route incoming messages to the application layer and automatically dispatch ACK envelopes.
+11. **User Interfaces:**
+    Starts the terminal CLI chat loop and launches the Flask REST API on the reserved HTTP port.
 
-## Flask HTTP API (declared in `main.py`)
-- `/messages` / `/messages/raw` / `/send` / `/peers` / `/health` / `/room-info` / `/status`.
-- All CORS-enabled so the React app on port 3000 can call them.
+---
 
-## Frontend `frontend/src/App.js`
-- React component:
-  - `useEffect`: every 2s `GET /messages` and stores array in state.
-  - `sendMessage`: `POST /send` with `{ message }`, clears input.
-  - Renders message bubbles, an input box, and a send button; logs errors to console.
-- `index.js`: React bootstrap; `reportWebVitals` unused by logic.
+## 3. Outgoing Message Lifecycle
 
-## Typical end-to-end runtime (annotated)
-1) User runs `python main.py` → prompts → chooses room/nickname.  
-2) Ports picked: P2P (e.g., 5000), HTTP (e.g., 5001).  
-3) `create_host` → TCP listener + accept loop.  
-4) `init_mdns` → UDP broadcast/listen threads; announce every 5s.  
-5) `join_chat_room` → handler registered; history initialized.  
-6) `start_terminal_interface` → input loop; user can type messages.  
-7) Flask starts → frontend can poll `/messages` and POST `/send`.  
-8) When another peer starts with the same room:  
-   - It hears the UDP announcement, calls `connect_to_peer`, sends handshake.  
-   - Receiver stores peer, sends its own handshake.  
-   - Both now have each other in their peer maps.  
-9) Sending a message (CLI or `/send`):  
-   - ChatRoom stores locally, broadcasts via host to all peers.  
-   - Each peer’s ChatRoom handler dedupes and prints once.  
-10) Shutdown (Ctrl+C): stops CLI, discovery (sockets closed), host socket closed; process exits.
+When a user submits a message via CLI or `POST /send`:
 
-## Why each piece matters
-- UDP discovery: removes manual IP entry; room filter isolates groups.  
-- Handshake with `peer_port`: makes peer lists symmetric, avoiding one-way delivery.  
-- MessageID dedupe: prevents loops and duplicate prints.  
-- Threaded design: discovery, TCP accept, CLI input, and Flask API run concurrently.  
-- HTTP API: enables a simple web UI without touching the P2P code.  
-- `DC_VERBOSE=1`: lets you turn on deep logs only when diagnosing issues.
+```text
+ChatRoom.publish("Hello")
+   │
+   ▼
+StoreForwardManager.enqueue_and_send()
+   │  ├─ Stores payload in SQLite (Status: QUEUED)
+   │  └─ Hands envelope to ReliableSender
+   ▼
+ReliableSender.send_reliable(envelope, destination)
+   │  ├─ Timestamps send for RTT measurement
+   │  ├─ Resolves destination to next_hop via RoutingTable
+   │  └─ Enqueues envelope to PriorityTransport (Priority: HIGH/MEDIUM/LOW)
+   ▼
+PriorityTransport worker thread
+   │  ├─ Dequeues highest priority packet
+   │  └─ Forwards to Router / HostTransport
+   ▼
+HostTransport.send(next_hop_socket, envelope)
+   │
+   ▼ (TCP Socket Transmission)
+```
 
-## Minimal changes you can make safely
-- Adjust polling interval in `frontend/src/App.js` if you want faster updates.  
-- Change room name prompt default in `main.py` to a preset for demos.  
-- Add a `POST /join` to programmatically set room/nickname (currently via prompt).  
-- Add a TTL cleanup for `seen_message_ids` if you expect extremely long sessions.
+- **ACK Reception:** When the destination responds with an ACK envelope, `ReliableSender` records the sample RTT, updates its EMA, and notifies `StoreForwardManager` to mark the message `DELIVERED`.
+- **Offline Destination:** If no route exists, `StoreForwardManager` keeps the message in SQLite (`QUEUED`). When `RoutingTable` reports route availability, it automatically dequeues and transmits the message.
+
+---
+
+## 4. Multi-Hop Forwarding Example ($A \rightarrow B \rightarrow C \rightarrow D$)
+
+Consider a linear mesh topology where node $A$ wishes to communicate with node $D$:
+
+```text
+Node A (19100) ──TCP── Node B (19101) ──TCP── Node C (19102) ──TCP── Node D (19103)
+```
+
+1. **Route Learning:**
+   - Node $D$ advertises itself to $C$ with $\text{hops}=1, \text{cost}=100$.
+   - Node $C$ computes its link cost to $D$ ($100 + \text{penalties}$) and advertises $D$ to $B$ with $\text{hops}=2, \text{cost}=200$.
+   - Node $B$ advertises $D$ to $A$ with $\text{hops}=3, \text{cost}=300$.
+   - Node $A$ installs a route: $\text{destination}=D, \text{next\_hop}=B, \text{hops}=3, \text{metric}=300$.
+2. **Forwarding Packet from $A$ to $D$:**
+   - Node $A$ sets $\text{TTL}=16, \text{hop\_count}=0, \text{destination}=D$ and sends to $B$.
+   - Node $B$'s `Router` inspects the destination. Since $D \neq B$, $B$ decrements $\text{TTL} \rightarrow 15$, increments $\text{hop\_count} \rightarrow 1$, queries its `RoutingTable` for $D$ ($\text{next\_hop}=C$), and transmits to $C$.
+   - Node $C$'s `Router` decrements $\text{TTL} \rightarrow 14$, increments $\text{hop\_count} \rightarrow 2$, queries `RoutingTable` ($\text{next\_hop}=D$), and transmits to $D$.
+   - Node $D$ recognizes itself as the destination, delivers the payload to `ChatRoom`, and sends an ACK along the reverse route.
+
+---
+
+## 5. Dynamic Weighted Routing & Anti-Flapping Hysteresis
+
+### Link Cost Calculation
+For any neighbor $N$, the link cost is computed dynamically:
+$$\text{link\_cost}(N) = 100 + \text{int}\left(\frac{\text{RTT}_{\text{EMA}}}{10}\right) + \text{int}(150 \times \text{retry\_rate}) + \text{int}(100 \times \text{queue\_pressure})$$
+
+### Anti-Flapping Hysteresis
+To prevent route oscillation caused by network jitter:
+- If a route via $N_{\text{curr}}$ is currently active with cost $C_{\text{curr}}$, an alternate next-hop $N_{\text{cand}}$ with cost $C_{\text{cand}}$ is only selected if:
+  $$C_{\text{cand}} < C_{\text{curr}} - \max(25, \text{int}(0.15 \times C_{\text{curr}}))$$
+- If the current route fails or is marked `DEAD`, the router switches immediately to the best available candidate without hysteresis penalty.
+
+---
+
+## 6. Partition Healing & Anti-Entropy Synchronization
+
+When network partitions heal:
+
+```text
+Partitioned:   [ Node A ── Node B ]      ||      [ Node C ── Node D ]
+                      │                                 │
+                 (Chat MSG-1)                      (Chat MSG-2)
+                      │                                 │
+Healed:        [ Node A ── Node B ══════════════ Node C ── Node D ]
+```
+
+1. **Reconnection Trigger:** `RoutingTable` detects route recovery between $B$ and $C$ and triggers `SyncManager.trigger_sync()`.
+2. **Sync Request:** Node $B$ sends a `sync_request` envelope to $C$ containing the list of message IDs stored in its local `StoreForwardQueue`.
+3. **Delta Calculation:** Node $C$ compares $B$'s message IDs against its own local store and identifies missing envelopes.
+4. **Sync Response:** Node $C$ transmits a `sync_response` containing the missing envelopes to $B$.
+5. **Ingestion & Application Delivery:** Node $B$ validates each envelope's TTL, checks for duplicates, stores the messages in its local archive, and delivers them to the application layer. Node $B$ similarly reciprocates missing envelopes back to $C$.
+
+---
+
+## 7. Logging & Observability
+
+DisasterConnect uses structured JSON logging (`p2p/log.py`). Configure logging verbosity using the `DC_LOG_LEVEL` environment variable:
+
+```powershell
+# Set log level in PowerShell
+$env:DC_LOG_LEVEL = "INFO"      # Options: DEBUG, INFO, WARNING, ERROR
+python main.py
+```
+
+Sample structured log output:
+```json
+{"time": "2026-08-20T14:28:47.158Z", "level": "INFO", "module": "p2p.routemanager", "msg": "multi-hop route installed: cbeb73d0 via ecbc3c49 (127.0.0.1:19101) cost=201 hops=2"}
+```
