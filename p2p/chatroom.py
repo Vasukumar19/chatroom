@@ -105,10 +105,11 @@ class ChatRoom:
                 print("❌ FATAL: ChatRoom is not configured with a delivery manager.")
                 return False
 
+            known = set()
             if hasattr(self.p2p_host, "get_known_peers"):
-                known = self.p2p_host.get_known_peers()
-            else:
-                known = None
+                known.update(self.p2p_host.get_known_peers())
+            if hasattr(self.delivery_manager, "route_manager") and hasattr(self.delivery_manager.route_manager, "list_routes"):
+                known.update(self.delivery_manager.route_manager.list_routes().keys())
 
             if known:
                 target_peers = [p for p in known if p != self.peer_id]
@@ -119,12 +120,14 @@ class ChatRoom:
                 else:
                     target_peers = [p for p in peers_raw if p != self.peer_id]
 
+            # Ensure we also include anyone we have queued messages for in the past
+            if hasattr(self.delivery_manager, "queue") and hasattr(self.delivery_manager.queue, "get_all_destinations"):
+                past_dests = self.delivery_manager.queue.get_all_destinations()
+                for d in past_dests:
+                    if d != self.peer_id and d not in target_peers:
+                        target_peers.append(d)
+
             if not target_peers:
-                # Case B: there has never been a known peer. Nothing was
-                # queued for reliable delivery because there is no
-                # destination to queue it for -- this is trivially
-                # "successful" (nothing failed) but callers must not report
-                # it as if a delivery/queue actually happened.
                 self.last_publish_status = 'NO_KNOWN_PEERS'
                 return True
 
@@ -193,17 +196,30 @@ class ChatRoom:
                 self.seen_message_ids.add(chat_msg.MessageID)
                 
                 # Display message
-                print(f"\n📥 {chat_msg.SenderNick}: {chat_msg.Message}")
-                print(f"[{self.nickname}] ", end='', flush=True)
+                try:
+                    print(f"\n📥 {chat_msg.SenderNick}: {chat_msg.Message}")
+                    print(f"[{self.nickname}] ", end='', flush=True)
+                except UnicodeEncodeError:
+                    try:
+                        print(f"\n[INBOX] {chat_msg.SenderNick}: {chat_msg.Message}")
+                        print(f"[{self.nickname}] ", end='', flush=True)
+                    except Exception:
+                        pass
                 
         except TypeError as e:
-            print(f"⚠️  Message parsing error: {e}")
-            import traceback
-            traceback.print_exc()
+            try:
+                print(f"⚠️  Message parsing error: {e}")
+            except UnicodeEncodeError:
+                print(f"[WARN] Message parsing error: {e}")
+            except Exception:
+                pass
         except Exception as e:
-            print(f"⚠️  Error handling message: {e}")
-            import traceback
-            traceback.print_exc()
+            try:
+                print(f"⚠️  Error handling message: {e}")
+            except UnicodeEncodeError:
+                print(f"[WARN] Error handling message: {e}")
+            except Exception:
+                pass
     
     def get_messages(self) -> List[str]:
         """
@@ -271,5 +287,8 @@ def join_chat_room(room_name: str, nickname: str, peer_id: str, p2p_host, *, del
         ChatRoom instance
     """
     chat_room = ChatRoom(room_name, nickname, peer_id, p2p_host, delivery_manager=delivery_manager)
-    print(f"✓ Joined room: '{room_name}'")
+    try:
+        print(f"✓ Joined room: '{room_name}'")
+    except UnicodeEncodeError:
+        print(f"[OK] Joined room: '{room_name}'")
     return chat_room

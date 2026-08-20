@@ -48,7 +48,7 @@ def create_envelope(
     destination: Optional[str] = None,
     sequence: Optional[int] = None,
     ttl: int = 8,
-    priority: int = 0,
+    priority: int = 1,
     protocol_version: str = "1",
     message_id: Optional[str] = None,
 ) -> Dict[str, Any]:

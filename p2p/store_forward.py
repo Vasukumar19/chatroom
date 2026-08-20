@@ -69,6 +69,15 @@ class StoreForwardQueue:
             )
             self._conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS message_archive (
+                    message_id TEXT PRIMARY KEY,
+                    envelope TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_messages_pending
                 ON messages(state, priority, created_at)
                 """
@@ -133,6 +142,11 @@ class StoreForwardQueue:
             rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_message(row) for row in rows]
 
+    def get_all_destinations(self) -> List[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT DISTINCT destination FROM messages").fetchall()
+            return [row[0] for row in rows]
+
     def mark_replaying(self, message_id: str) -> None:
         with self._lock:
             self._conn.execute(
@@ -140,6 +154,44 @@ class StoreForwardQueue:
                 (_utc_now_iso(), message_id),
             )
             self._conn.commit()
+
+    def archive_message(self, message_id: str, envelope: Dict[str, Any]) -> None:
+        """Persist a raw envelope securely for future synchronization."""
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO message_archive (message_id, envelope, created_at) VALUES (?, ?, ?)",
+                    (message_id, json.dumps(envelope), _utc_now_iso())
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                pass  # Already archived
+
+    def get_archived_message_ids(self) -> List[str]:
+        """Return a list of all locally known message IDs."""
+        with self._lock:
+            rows = self._conn.execute("SELECT message_id FROM message_archive").fetchall()
+            return [row[0] for row in rows]
+
+    def get_archived_message(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a specific archived envelope."""
+        with self._lock:
+            row = self._conn.execute("SELECT envelope FROM message_archive WHERE message_id = ?", (message_id,)).fetchone()
+            if row:
+                return json.loads(row[0])
+            return None
+
+    def get_all_archived_envelopes(self) -> List[Dict[str, Any]]:
+        """Retrieve all archived envelopes."""
+        with self._lock:
+            rows = self._conn.execute("SELECT envelope FROM message_archive").fetchall()
+            res = []
+            for row in rows:
+                try:
+                    res.append(json.loads(row[0]))
+                except Exception:
+                    pass
+            return res
 
     def mark_delivered(self, message_id: str) -> None:
         with self._lock:

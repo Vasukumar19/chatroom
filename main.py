@@ -18,6 +18,9 @@ from p2p.routing import RoutingTable
 from p2p.store_forward import StoreForwardQueue
 from p2p.store_forward_manager import StoreForwardManager
 from p2p.transport import HostTransport
+from p2p.peermanager import PeerManager
+from p2p.routemanager import RouteLearner
+from p2p.sync import SyncManager
 from cli_interface import start_terminal_interface
 
 # Flask setup with minimal logging
@@ -41,6 +44,8 @@ reliable_sender = None
 reliable_receiver = None
 store_forward_manager = None
 store_forward_queue = None
+peer_manager = None
+route_learner = None
 
 
 def find_free_port(start_port=5000, max_attempts=100):
@@ -255,11 +260,21 @@ def internal_error(error):
 # ==================== P2P INITIALIZATION ====================
 
 def on_peer_discovered(peer_id: str, peer_ip: str, peer_port: int):
-    """Handle newly discovered peer"""
+    """Handle newly discovered peer.
+
+    Installs a direct route, notifies PeerManager (which triggers RouteLearner
+    to advertise routes to the new peer), and replays any queued messages.
+    """
     if p2p_host:
         p2p_host.connect_to_peer(peer_ip, peer_port, peer_id)
-    if routing_table and store_forward_manager:
+    if routing_table:
         routing_table.add_route(peer_id, peer_id, peer_ip, peer_port)
+        print(f"[Discovery] Route installed: {peer_id} -> direct {peer_ip}:{peer_port}")
+    if peer_manager:
+        # Notifies RouteLearner via on_peer_discovered callback, which sends
+        # a route_advertisement to the new peer so multi-hop routes propagate.
+        peer_manager.update_peer(peer_id, peer_ip, peer_port)
+    if store_forward_manager:
         store_forward_manager.on_route_recovered(peer_id)
 
 
@@ -268,6 +283,7 @@ def initialize_p2p(p2p_port: int, room_name: str, nickname: str, *, p2p_port_res
     global p2p_host, chat_room, peer_discovery, terminal_interface
     global transport, routing_table, router, reliable_sender, reliable_receiver
     global store_forward_manager, store_forward_queue
+    global peer_manager, route_learner
     
     print("\n" + "─"*70)
     print("🚀 Starting DisasterConnect...")
@@ -287,6 +303,12 @@ def initialize_p2p(p2p_port: int, room_name: str, nickname: str, *, p2p_port_res
     time.sleep(0.5)
 
     transport = HostTransport(p2p_host)
+    
+    # Wrap transport with Priority/Congestion Control
+    from p2p.qos import PriorityTransport
+    transport = PriorityTransport(transport, max_queue_size=100)
+    transport.start()
+
     routing_table = RoutingTable()
     router = Router(p2p_host.peer_id, transport, routing_table)
     router.start()
@@ -304,7 +326,26 @@ def initialize_p2p(p2p_port: int, room_name: str, nickname: str, *, p2p_port_res
         reliable_sender=reliable_sender,
         route_manager=routing_table,
     )
-    
+    routing_table.add_route_recovery_callback(store_forward_manager.on_route_recovered)
+
+    # Wire multi-hop route learning.
+    # PeerManager tracks which direct peers are alive.
+    # RouteLearner listens for route_advertisement messages on the transport,
+    # installs multi-hop routes into RoutingTable, and re-advertises our own
+    # routes whenever the routing topology changes.
+    peer_manager = PeerManager(p2p_host.peer_id)
+    route_learner = RouteLearner(
+        p2p_host.peer_id,
+        peer_manager,
+        routing_table,
+        transport,
+        reliable_sender=reliable_sender,
+        min_advert_interval=1.0,
+    )
+    peer_manager.start()
+    route_learner.start()     # registers transport handler + sends initial adverts
+    print("✓ Route learner started — multi-hop route advertisements active")
+
     # Step 2: Start Peer Discovery
     print("[2/4] 📡 Starting peer discovery...")
     peer_discovery = init_mdns(
@@ -328,14 +369,28 @@ def initialize_p2p(p2p_port: int, room_name: str, nickname: str, *, p2p_port_res
             raise RuntimeError(f"No route to {destination}")
         router._send_on_route(route, ack)
 
+    def handle_app(envelope, addr):
+        payload = envelope.get("payload", {})
+        chat_room._handle_incoming_message(payload)
+
     reliable_receiver = ReliableReceiver(
         p2p_host.peer_id,
         transport,
-        lambda envelope, address: chat_room._handle_incoming_message(envelope['payload']),
+        handle_app,
         auto_register=False,
         ack_sender=send_ack,
+        message_archiver=store_forward_queue.archive_message
     )
     router.add_app_handler(reliable_receiver._on_transport_message)
+
+    sync_manager = SyncManager(
+        p2p_host.peer_id,
+        transport,
+        store_forward_queue,
+        reliable_receiver,
+        route_manager=routing_table
+    )
+    routing_table.add_route_recovery_callback(sync_manager.trigger_sync)
     time.sleep(0.5)
     
     # Step 4: Start Terminal Interface
@@ -415,6 +470,14 @@ if __name__ == '__main__':
         if peer_discovery:
             peer_discovery.stop()
             print("✓ Peer discovery stopped")
+
+        if route_learner:
+            route_learner.stop()
+            print("✓ Route learner stopped")
+
+        if peer_manager:
+            peer_manager.stop()
+            print("✓ Peer manager stopped")
         
         if p2p_host:
             p2p_host.stop()

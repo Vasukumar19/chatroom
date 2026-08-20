@@ -1,0 +1,43 @@
+﻿name: CI
+
+on:
+  push:
+    branches: ["master", "main"]
+  pull_request:
+    branches: ["master", "main"]
+
+jobs:
+  test:
+    name: "pytest / Python ${{ matrix.python-version }} / ${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        # PYTHONIOENCODING=utf-8 ensures print() with non-ASCII works on Windows.
+        # DC_LOG_LEVEL=WARNING suppresses info-level structured log output during tests.
+        run: python -m pytest -v --tb=short
+        env:
+          PYTHONIOENCODING: "utf-8"
+          DC_LOG_LEVEL: "WARNING"
+
+      - name: Check for whitespace errors
+        if: runner.os == 'Linux'
+        run: git diff --check

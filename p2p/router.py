@@ -1,10 +1,13 @@
-"""Router: transport-agnostic forwarding/router component for Phase 5."""
-from typing import Callable, Optional
+"""Router: central message forwarding and loop prevention."""
 import threading
 import time
+from typing import Callable, Dict, Optional, Tuple, Set
 
 from p2p.protocol import validate_envelope, create_envelope
 from p2p.routing import RoutingTable
+from p2p.log import get_logger
+
+log = get_logger("p2p.router")
 
 
 class Router:
@@ -25,6 +28,13 @@ class Router:
         # register to receive incoming transport messages
         try:
             self.transport.register_handler(self._on_transport_message)
+        except Exception:
+            pass
+
+    def stop(self):
+        try:
+            if hasattr(self.transport, 'unregister_handler'):
+                self.transport.unregister_handler(self._on_transport_message)
         except Exception:
             pass
 
@@ -93,9 +103,10 @@ class Router:
             # no route or next hop unavailable
             return
         try:
+            log.info(f"forwarding to {dest} via next_hop={route.next_hop}", extra={"node_id": self.node_id, "dest": dest, "next_hop": route.next_hop, "ip": route.ip, "port": route.port})
             self._send_on_route(route, msg)
-        except Exception:
-            pass
+        except Exception as e:
+            log.error(f"failed to forward to {dest} via {route.next_hop}: {e}", extra={"node_id": self.node_id})
 
     def _cleanup_seen(self, now: float):
         # Remove seen entries older than TTL

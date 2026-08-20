@@ -7,6 +7,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from p2p.store_forward import QueuedMessage
+from p2p.log import get_logger
+
+log = get_logger("p2p.store_forward_manager")
 
 
 @dataclass
@@ -90,6 +93,11 @@ class StoreForwardManager:
 
     def send(self, destination: str, payload: Any, *, ttl: Optional[float] = None, priority: int = 0):
         message = self._create_queued_message(destination, payload, ttl=ttl, priority=priority)
+
+        # Archive the original envelope for sync recovery
+        if self.queue is not None and hasattr(self.queue, "archive_message"):
+            self.queue.archive_message(message.envelope.get("message_id", message.message_id), message.envelope)
+
         if self.route_manager is not None and not self.route_manager.route_available(destination):
             if self.queue is not None:
                 self.queue.enqueue(message)
@@ -121,6 +129,7 @@ class StoreForwardManager:
                     pass
 
         if self.queue is not None:
+            log.info(f"queued message {message.message_id} to {destination}", extra={"dest": destination, "message_id": message.message_id})
             self.queue.enqueue(message)
             return DeliveryResult(status="QUEUED", message_id=message.message_id, error="send failed; queued")
         return DeliveryResult(status="FAILED", message_id=message.message_id, error="send failed")
@@ -135,6 +144,7 @@ class StoreForwardManager:
             if message.expires_at is not None:
                 now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
                 if message.expires_at <= now:
+                    log.debug(f"discarding expired queued message {message.message_id}", extra={"dest": message.destination, "message_id": message.message_id})
                     self.queue.mark_expired(message.message_id)
                     continue
 
@@ -165,9 +175,11 @@ class StoreForwardManager:
                 ok = send_method(message.destination, payload)
 
             if ok:
+                log.info(f"successfully replayed message {message.message_id} to {message.destination}", extra={"dest": message.destination, "message_id": message.message_id})
                 self.queue.mark_delivered(message.message_id)
                 results.append(DeliveryResult(status="DELIVERED", message_id=message.message_id))
             else:
+                log.warning(f"failed to replay message {message.message_id} to {message.destination}", extra={"dest": message.destination, "message_id": message.message_id})
                 self.queue.mark_failed(message.message_id, "replay failed")
                 results.append(DeliveryResult(status="FAILED", message_id=message.message_id, error="replay failed"))
 

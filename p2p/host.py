@@ -47,7 +47,10 @@ class P2PHost:
         self.socket.settimeout(1.0)
         self.running = True
         
-        print(f"✓ P2P Host started (ID: {self.peer_id})")
+        try:
+            print(f"✓ P2P Host started (ID: {self.peer_id})")
+        except UnicodeEncodeError:
+            print(f"[OK] P2P Host started (ID: {self.peer_id})")
         
         listen_thread = threading.Thread(
             target=self._listen_for_connections,
@@ -169,10 +172,16 @@ class P2PHost:
             else:
                 self._send_to_peer(peer_id, handshake)
             
-            print(f"✓ Connected to peer {peer_id}")
+            try:
+                print(f"✓ Connected to peer {peer_id}")
+            except UnicodeEncodeError:
+                print(f"[OK] Connected to peer {peer_id}")
             return True
         except Exception as e:
-            print(f"⚠️  Failed to connect to peer {peer_id}: {e}")
+            try:
+                print(f"⚠️  Failed to connect to peer {peer_id}: {e}")
+            except UnicodeEncodeError:
+                print(f"[!] Failed to connect to peer {peer_id}: {e}")
             import traceback
             traceback.print_exc()
             return False
